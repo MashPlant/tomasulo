@@ -1,126 +1,189 @@
 #![feature(rustc_attrs)]
 #![feature(core_intrinsics)]
 
-pub mod inst;
-
+use wasm_bindgen::prelude::*;
+use std::ops::{Deref, DerefMut};
 use crate::inst::*;
 
+pub mod inst;
+pub mod ser;
+
+// #[cfg(feature = "wee_alloc")]
+// #[global_allocator]
+// static ALLOC: wee_alloc::WeeAlloc = wee_alloc::WeeAlloc::INIT;
+
+#[derive(Default, Copy, Clone)]
 pub struct RSBase {
-  pub fu: Option<RegId>,
+  pub busy: bool,
+  // None if no fu is allocated to this rs
+  pub remain_time: Option<u8>,
+  // used to identify logic order in reservation station
   pub issue_time: u32,
-  pub remain_time: u32,
   // only for displaying, not used in executing
-  pub inst: u32,
+  pub inst_idx: u32,
 }
 
+impl RSBase {
+  fn issue(&mut self, clk: u32, pc: u32) {
+    self.busy = true;
+    self.remain_time = None;
+    self.issue_time = clk;
+    self.inst_idx = pc;
+  }
+}
+
+#[derive(Default, Copy, Clone)]
 pub struct LoadBuffer {
   pub base: RSBase,
   pub imm: u32,
 }
 
+impl Deref for LoadBuffer {
+  type Target = RSBase;
+  fn deref(&self) -> &Self::Target { &self.base }
+}
+
+impl DerefMut for LoadBuffer {
+  fn deref_mut(&mut self) -> &mut Self::Target { &mut self.base }
+}
+
+#[derive(Copy, Clone)]
 pub struct ReservationStation {
   pub base: RSBase,
   // Ok(op) => bin, Err(off) => jump
   pub op: Result<BinOp, u32>,
-  // Ok(imm) => source register available, Err( index) => source register pending
-  pub qv: (Result<u32, RegId>, Result<u32, RegId>),
+  pub qv: [Result<u32, usize>; 2],
 }
 
-#[derive(Default)]
+impl Deref for ReservationStation {
+  type Target = RSBase;
+  fn deref(&self) -> &Self::Target { &self.base }
+}
+
+impl DerefMut for ReservationStation {
+  fn deref_mut(&mut self) -> &mut Self::Target { &mut self.base }
+}
+
+const REG: usize = 32;
+// number of reservation stations
+const ARS: usize = 6;
+const MRS: usize = 3;
+const LB: usize = 3;
+// number of function units
+const ADD: usize = 3;
+const MULT: usize = 2;
+const LOAD: usize = 2;
+
+#[wasm_bindgen]
 pub struct Tomasulo {
-  pub insts: Vec<Inst>,
-  pub pc: u32,
-  pub clk: u32,
-  pub reg_vals: [u32; REG_N],
-  // indices in respective reservation stations (though its type is Option<RegId>)
-  // using RegId is only to save spaces, otherwise Option<u8> will take 2 bytes
-  // RegId is limited to < REG_N, which is enough, because now #reservation stations < REG_N
-  pub reg_stats: [Option<RegId>; REG_N],
+  insts: Vec<Inst>,
+  times: Vec<(u32, u32)>,
+  pc: u32,
+  clk: u32,
+  // Ok(u32) => value, Err(idx) => index in rss/lbs
+  regs: [Result<u32, usize>; REG],
   // below are reservation stations
-  pub add_rss: [Option<ReservationStation>; 6],
-  pub mul_rss: [Option<ReservationStation>; 3],
-  pub load_buffers: [Option<LoadBuffer>; 3],
-  // below are functions units, values are indices in respective reservation stations
-  pub adders: [Option<RegId>; 3],
-  pub mulers: [Option<RegId>; 2],
-  pub loaders: [Option<RegId>; 2],
+  rss: [ReservationStation; ARS + MRS],
+  lbs: [LoadBuffer; LB],
 }
 
-pub const ADD_RS_OFF: u8 = 0;
-pub const MUL_RS_OFF: u8 = 6 /* = add_rss.len() */;
-pub const LB_OFF: u8 = 6 + 3 /* = add_rss.len() + mul_rss.len() */;
-pub const RS_END: u8 = 6 + 3 + 3 /* = add_rss.len() + mul_rss.len() + load_buffers.len() */;
+impl Default for Tomasulo {
+  fn default() -> Self {
+    Self {
+      insts: Vec::new(),
+      times: Vec::new(),
+      // the remaining is essentially mem::zeroed()
+      pc: 0,
+      clk: 0,
+      regs: [Ok(0); REG],
+      rss: [ReservationStation { base: Default::default(), op: Ok(Add), qv: [Ok(0); 2] }; ARS + MRS],
+      lbs: Default::default(),
+    }
+  }
+}
 
+#[wasm_bindgen]
 impl Tomasulo {
-  pub fn new(code: &str) -> Result<Tomasulo, u32> {
+  pub fn new(code: &str) -> Result<Tomasulo, JsValue> {
     let mut insts = Vec::new();
     for (idx, s) in code.lines().enumerate() {
-      insts.push(Inst::parse(s).ok_or(idx as u32)?);
+      insts.push(Inst::parse(s).ok_or_else(|| JsValue::from((idx + 1) as f64))?);
     }
-    Ok(Tomasulo { insts, ..Default::default() })
+    Ok(Tomasulo { times: vec![(0, 0); insts.len()], insts, ..Default::default() })
   }
 
   pub fn reset(&mut self) {
     let mut empty = Tomasulo::default();
     std::mem::swap(&mut self.insts, &mut empty.insts);
+    std::mem::swap(&mut self.times, &mut empty.times);
+    for x in &mut empty.times { *x = (0, 0); }
     *self = empty;
   }
 
+  // return `true` when  execution is not finished
   pub fn step(&mut self) -> bool {
-    // in order to use serial code to simulate a pipeline
-    // the later stage in the pipeline should be executed earlier
-    self.finish();
-    self.exec();
+    self.clk += 1; // initial value of `clock` is 0, now add it before any operation, so they will see initial clock == 1
+    self.write_back();
     self.issue();
-    self.clk += 1;
-    false
+    self.exec();
+    let mut ret = (self.pc as usize) < self.insts.len();
+    for rs in self.rss.iter() { ret |= rs.busy; }
+    for lb in self.lbs.iter() { ret |= lb.busy; }
+    ret
   }
+}
 
-  fn qv(&self, r: RegId) -> Result<u32, RegId> {
-    let r = r.get() as usize;
-    if let Some(q) = self.reg_stats[r] { Err(q) } else { Ok(self.reg_vals[r]) }
+impl Tomasulo {
+  fn issue_inst(&mut self) {
+    let issue_time = &mut self.times[self.pc as usize].0;
+    if *issue_time == 0 { *issue_time = self.clk; }
+    self.pc += 1;
   }
 
   fn issue(&mut self) {
-    for rv in self.add_rss.iter() {
-      // an unfinished JUMP
-      if let Some(ReservationStation { op: Err(_), .. }) = rv { return; }
+    for r in self.rss.iter() {
+      // when exists an unfinished JUMP, can't issue
+      if r.busy && r.op.is_err() { return; }
     }
     if let Some(&inst) = self.insts.get(self.pc as usize) {
       match inst {
         Bin(op, dst, l, r) => {
-          let (qv_l, qv_r) = (self.qv(l), self.qv(r));
-          let (rss, off) = if op == Add || op == Sub {
-            (self.add_rss.as_mut(), ADD_RS_OFF)
-          } else {
-            (self.mul_rss.as_mut(), MUL_RS_OFF)
-          };
-          if let Some(idx) = rss.iter_mut().position(|x| x.is_none()) {
-            rss[idx] = Some(ReservationStation {
-              base: RSBase { fu: None, issue_time: self.clk, remain_time: op.delay(), inst: self.pc },
-              op: Ok(op),
-              qv: (qv_l, qv_r),
-            });
-            self.reg_stats[dst.get() as usize] = RegId::new(idx as u8 + off); // the return value must be Some(_)
-            self.pc += 1;
+          let (beg, end) = if op == Add || op == Sub { (0, ARS) } else { (ARS, ARS + MRS) };
+          for idx in beg..end {
+            let rs = &mut self.rss[idx];
+            if !rs.busy {
+              rs.issue(self.clk, self.pc);
+              rs.op = Ok(op);
+              rs.qv[0] = self.regs[l];
+              rs.qv[1] = self.regs[r];
+              self.regs[dst] = Err(idx);
+              self.issue_inst();
+              break;
+            }
           }
         }
         Ld(dst, imm) => {
-          if let Some(idx) = self.load_buffers.iter_mut().position(|x| x.is_none()) {
-            self.load_buffers[idx] = Some(LoadBuffer { base: RSBase { fu: None, issue_time: self.clk, remain_time: 3, inst: self.pc }, imm });
-            self.reg_stats[dst.get() as usize] = RegId::new(idx as u8 + LB_OFF); // the return value must be Some(_)
-            self.pc += 1;
+          for (idx, l) in self.lbs.iter_mut().enumerate() {
+            if !l.busy {
+              l.issue(self.clk, self.pc);
+              l.imm = imm;
+              self.regs[dst] = Err(idx + ARS + MRS);
+              self.issue_inst();
+              break;
+            }
           }
         }
-        Jump(l, r, off) => {
-          let qv_l = self.qv(l);
-          // JUMP use add reservation station and add function unit, but won't write to any register
-          if let Some(rv) = self.add_rss.iter_mut().find(|x| x.is_none()) {
-            *rv = Some(ReservationStation {
-              base: RSBase { fu: None, issue_time: self.clk, remain_time: 1, inst: self.pc },
-              op: Err(off),
-              qv: (qv_l, Ok(r)),
-            });
+        Jump(cmp, cond, off) => {
+          for r in self.rss.iter_mut().take(ARS) {
+            if !r.busy {
+              r.issue(self.clk, self.pc);
+              // when jumping, pc have already incremented, so need to -1 here to compensate
+              r.op = Err(off - 1);
+              r.qv[0] = self.regs[cond];
+              r.qv[1] = Ok(cmp);
+              self.issue_inst();
+              break;
+            }
           }
         }
       };
@@ -128,65 +191,86 @@ impl Tomasulo {
   }
 
   fn exec(&mut self) {
-    macro_rules! work {
-      ($rs: ident, $fu: ident) => {
-        for (i, rs) in self.$rs.iter_mut().enumerate() {
-          if let Some(rs) = rs {
-            if rs.base.fu.is_some() { rs.base.remain_time -= 1; } else {
-              for (j, fu) in self.$fu.iter_mut().enumerate() {
-                if fu.is_none() {
-                  rs.base.fu = RegId::new(j as u8);
-                  *fu = RegId::new(i as u8);
-                  break;
-                }
-              }
-            }
-          }
+    // borrow checking on function level is too coarse, so use a macro
+    macro_rules! exec_inst {
+      ($t: expr, $rs: expr) => {
+        *$t -= 1;
+        if *$t == 0 {
+          let comp_time = &mut self.times[$rs.inst_idx as usize].1;
+          if *comp_time == 0 { *comp_time = self.clk; }
         }
       };
     }
-    work!(load_buffers, loaders);
-    work!(add_rss, adders);
-    work!(mul_rss, mulers);
-  }
-
-  fn cdb_broadcast(&mut self, r: RegId, v: u32) {
-    for rv in self.add_rss.iter_mut().chain(self.mul_rss.iter_mut()) {
-      if let Some(rv) = rv {
-        if rv.qv.0 == Err(r) { rv.qv.0 = Ok(v); }
-        if rv.qv.1 == Err(r) { rv.qv.1 = Ok(v); }
-      }
-    }
-    for (stat, val) in self.reg_stats.iter_mut().zip(self.reg_vals.iter_mut()) {
-      if *stat == Some(r) {
-        *stat = None;
-        *val = v;
-      }
-    }
-  }
-
-  fn finish(&mut self) {
-    macro_rules! work {
-      ($rs: ident, $fu: ident, $off: ident) => {
-        for i in 0..self.$rs.len() {
-          if let Some(ReservationStation { base: RSBase { fu: Some(fu), remain_time: 0, .. }, op, qv: (Ok(l), Ok(r)), }) = self.$rs[i] {
-            match op {
-              Ok(op) => self.cdb_broadcast(RegId::new(i as u8 + $off).unwrap(), op.eval(l, r)),
-              Err(off) => if l == r { self.pc = self.pc.wrapping_add(off); }
-            }
-            self.$rs[i] = None;
-            self.$fu[fu.get() as usize] = None;
+    for i in 0..ARS + MRS {
+      let rs = &mut self.rss[i];
+      if rs.busy {
+        if let Some(t) = &mut rs.remain_time {
+          exec_inst!(t, rs);
+        } else if let [Ok(l), Ok(r)] = rs.qv { // not running, but operands available
+          let (beg, end, cap) = if i < ARS { (0, ARS, ADD) } else { (ARS, ARS + MRS, MULT) };
+          let (mut cnt, issue_time) = (0, rs.issue_time);
+          for j in beg..end { // count occupied function units
+            let rs1 = &self.rss[j];
+            // already have fu, or have higher priority than `rs` in competing for fu
+            cnt += (rs1.busy && (rs1.remain_time.is_some() || (rs1.qv[0].is_ok() && rs1.qv[1].is_ok() && rs1.issue_time < issue_time))) as usize;
+          }
+          let rs = &mut self.rss[i]; // fk borrow checker
+          if cnt < cap {
+            rs.remain_time = Some(match rs.op { Ok(op) => op.delay(l, r), Err(_) => 1 }); // 1 is Jump exec time
           }
         }
-      };
+      }
     }
-    work!(add_rss, adders, ADD_RS_OFF);
-    work!(mul_rss, mulers, MUL_RS_OFF);
-    for i in 0..self.load_buffers.len() {
-      if let Some(LoadBuffer { base: RSBase { fu: Some(fu), remain_time: 0, .. }, imm }) = self.load_buffers[i] {
-        self.cdb_broadcast(RegId::new(i as u8 + LB_OFF).unwrap(), imm);
-        self.load_buffers[i] = None;
-        self.loaders[fu.get() as usize] = None;
+    for i in 0..LB {
+      let l = &mut self.lbs[i];
+      if l.busy {
+        if let Some(t) = &mut l.remain_time {
+          exec_inst!(t, l);
+        } else {
+          let (mut cnt, issue_time) = (0, l.issue_time);
+          for j in 0..LB {
+            let l1 = &self.lbs[j];
+            cnt += (l1.busy && (l1.remain_time.is_some() || l1.issue_time < issue_time)) as usize;
+          }
+          if cnt < LOAD {
+            self.lbs[i].remain_time = Some(3); // 3 is Ld exec time
+          }
+        }
+      }
+    }
+  }
+
+  fn cdb_broadcast(&mut self, rs: usize, v: u32) {
+    for r in self.rss.iter_mut() {
+      // modifying a non-busy r doesn't have any bad side effect
+      if r.qv[0] == Err(rs) { r.qv[0] = Ok(v); }
+      if r.qv[1] == Err(rs) { r.qv[1] = Ok(v); }
+    }
+    for r in self.regs.iter_mut() {
+      if *r == Err(rs) { *r = Ok(v) }
+    }
+  }
+
+  fn write_back(&mut self) {
+    for idx in 0..ARS + MRS {
+      let r = &mut self.rss[idx];
+      if r.busy && r.remain_time == Some(0) {
+        r.busy = false;
+        match r.op {
+          Ok(op) => {
+            let v = op.eval(r.qv[0].unwrap(), r.qv[1].unwrap());
+            self.cdb_broadcast(idx, v);
+          }
+          Err(off) => if r.qv[0] == r.qv[1] { self.pc += off; }
+        }
+      }
+    }
+    for idx in 0..LB {
+      let l = &mut self.lbs[idx];
+      if l.busy && l.remain_time == Some(0) {
+        l.busy = false;
+        let v = l.imm;
+        self.cdb_broadcast(idx + ARS + MRS, v);
       }
     }
   }

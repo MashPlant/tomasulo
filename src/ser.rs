@@ -12,16 +12,20 @@ impl Serialize for Tomasulo {
     impl Serialize for QVWrapper {
       fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         match self.0 {
-          Ok(v) => s.serialize_u32(v),
+          Ok(v) => s.serialize_i32(v as _),
           Err(q) => s.serialize_str(RS_NAMES[q]),
         }
       }
     }
     unsafe {
-      let mut st = s.serialize_struct("", 3)?; // name is not used in json
+      let mut st = s.serialize_struct("", 7)?; // name is not used in json
+      st.serialize_field("clk", &self.clk)?;
+      st.serialize_field("pc", &self.pc)?;
+      st.serialize_field("done", &self.done())?;
       st.serialize_field("regs", &*(&self.regs as *const _ as *const [QVWrapper; REG]))?;
       st.serialize_field("rss", &*(&self.rss as *const _ as *const RSSWrapper))?;
       st.serialize_field("lbs", &*(&self.lbs as *const _ as *const LBSWrapper))?;
+      st.serialize_field("times", &self.times)?;
       st.end()
     }
   }
@@ -54,9 +58,19 @@ impl Serialize for RSWrapper<'_> {
     let &RSWrapper(idx, r) = self;
     let mut st = s.serialize_struct("", 3 + 3)?;
     serialize_rs_base::<S>(idx, r, &mut st)?;
-    st.serialize_field("op", match r.op { Ok(op) => op.name(), Err(_) => "JUMP" })?;
-    match r.qv[0] { Ok(v) => st.serialize_field("vj", &v), Err(q) => st.serialize_field("qj", RS_NAMES[q]) }?;
-    match r.qv[1] { Ok(v) => st.serialize_field("vk", &v), Err(q) => st.serialize_field("qk", RS_NAMES[q]) }?;
+    st.serialize_field("Op", match r.op { Ok(op) => op.name(), Err(_) => "JUMP" })?;
+    for &(idx, v_name, q_name) in [(0, "Vj", "Qj"), (1, "Vk", "Qk")].iter() {
+      match r.qv[idx] {
+        Ok(v) => {
+          st.serialize_field(v_name, &(v as i32))?;
+          st.serialize_field(q_name, "")?;
+        }
+        Err(q) => {
+          st.serialize_field(v_name, "")?;
+          st.serialize_field(q_name, RS_NAMES[q])?;
+        }
+      };
+    }
     st.end()
   }
 }
@@ -68,15 +82,15 @@ impl Serialize for LBWrapper<'_> {
     let &LBWrapper(idx, l) = self;
     let mut st = s.serialize_struct("", 3 + 1)?;
     serialize_rs_base::<S>(idx + ARS + MRS, l, &mut st)?;
-    st.serialize_field("imm", &l.imm)?;
+    st.serialize_field("Imm", &(l.imm as i32))?;
     st.end()
   }
 }
 
 fn serialize_rs_base<S: Serializer>(idx: usize, r: &RSBase, st: &mut S::SerializeStruct) -> Result<(), S::Error> {
-  st.serialize_field("name", RS_NAMES[idx])?;
-  st.serialize_field("busy", &r.busy)?;
-  if let Some(t) = r.remain_time { st.serialize_field("remain", &(t as u32)) } else { st.serialize_field("remain", "") }
+  st.serialize_field("Name", RS_NAMES[idx])?;
+  st.serialize_field("Busy", &r.busy)?;
+  if let Some(t) = r.remain_time { st.serialize_field("Remain", &t) } else { st.serialize_field("Remain", "") }
 }
 
 #[wasm_bindgen]

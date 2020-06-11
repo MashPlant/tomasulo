@@ -63,9 +63,9 @@ impl BinOp {
 impl fmt::Display for Inst {
   fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
     match self {
-      Ld(dst, imm) => write!(f, "LD {},{}", dst, imm),
-      Bin(op, dst, l, r) => write!(f, "{} {},{},{}", op.name(), dst, l, r),
-      Jump(cmp, cond, off) => write!(f, "JUMP {},{},{}", cmp, cond, off),
+      Ld(dst, imm) => write!(f, "LD,R{},{:#X}", dst, imm),
+      Bin(op, dst, l, r) => write!(f, "{},R{},R{},R{}", op.name(), dst, l, r),
+      Jump(cmp, cond, off) => write!(f, "JUMP,{:#X},R{},{:#X}", cmp, cond, off),
     }
   }
 }

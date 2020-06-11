@@ -107,7 +107,7 @@ impl Tomasulo {
   pub fn new(code: &str) -> Result<Tomasulo, JsValue> {
     let mut insts = Vec::new();
     for (idx, s) in code.lines().enumerate() {
-      insts.push(Inst::parse(s).ok_or_else(|| JsValue::from((idx + 1) as f64))?);
+      insts.push(Inst::parse(s).ok_or_else(|| JsValue::from(idx as f64))?);
     }
     Ok(Tomasulo { times: vec![(0, 0); insts.len()], insts, ..Default::default() })
   }
@@ -120,20 +120,29 @@ impl Tomasulo {
     *self = empty;
   }
 
-  // return `true` when  execution is not finished
-  pub fn step(&mut self) -> bool {
+  pub fn step(&mut self) {
     self.clk += 1; // initial value of `clock` is 0, now add it before any operation, so they will see initial clock == 1
     self.write_back();
     self.issue();
     self.exec();
-    let mut ret = (self.pc as usize) < self.insts.len();
-    for rs in self.rss.iter() { ret |= rs.busy; }
-    for lb in self.lbs.iter() { ret |= lb.busy; }
-    ret
+  }
+
+  pub fn run_n(&mut self, n: u32) {
+    for _ in 0..n {
+      self.step();
+      if self.done() { break; }
+    }
   }
 }
 
 impl Tomasulo {
+  fn done(&self) -> bool {
+    let mut ret = (self.pc as usize) < self.insts.len();
+    for rs in self.rss.iter() { ret |= rs.busy; }
+    for lb in self.lbs.iter() { ret |= lb.busy; }
+    !ret
+  }
+
   fn issue_inst(&mut self) {
     let issue_time = &mut self.times[self.pc as usize].0;
     if *issue_time == 0 { *issue_time = self.clk; }

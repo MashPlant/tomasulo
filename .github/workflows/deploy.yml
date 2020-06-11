@@ -13,11 +13,11 @@ jobs:
         uses: actions/setup-node@v1
         with:
           node-version: ${{ matrix.node }}
-      - run: cp -r pkg www && cd www && npm install && npm build
+      - run: cd www && npm install && npm run build
       - name: Deploy
         uses: JamesIves/github-pages-deploy-action@2.0.2
         env:
           ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
           BASE_BRANCH: master
           BRANCH: gh-pages
-          FOLDER: www
+          FOLDER: www/dist
